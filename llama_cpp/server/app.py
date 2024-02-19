@@ -1,48 +1,285 @@
 from __future__ import annotations
 
-import os
+import asyncio
 import json
-
-from threading import Lock
+import logging
+import os
+import queue
 from functools import partial
-from typing import Iterator, List, Optional, Union, Dict
-
-import llama_cpp
+from logging.handlers import QueueHandler, QueueListener
+from threading import Lock
+from typing import Dict, Final, Iterator, List, Optional, Union
 
 import anyio
+import llama_cpp
 from anyio.streams.memory import MemoryObjectSendStream
-from starlette.concurrency import run_in_threadpool, iterate_in_threadpool
 from fastapi import (
+    APIRouter,
+    BackgroundTasks,
     Depends,
     FastAPI,
-    APIRouter,
-    Request,
     HTTPException,
+    Request,
     status,
 )
 from fastapi.middleware import Middleware
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer
-from sse_starlette.sse import EventSourceResponse
-from starlette_context.plugins import RequestIdPlugin  # type: ignore
-from starlette_context.middleware import RawContextMiddleware
-
-from llama_cpp.server.model import (
-    LlamaProxy,
-)
+from llama_cpp.server.errors import RouteErrorHandler
+from llama_cpp.server.model import LlamaProxy
 from llama_cpp.server.settings import (
     ConfigFileSettings,
-    Settings,
     ModelSettings,
     ServerSettings,
+    Settings,
 )
 from llama_cpp.server.types import (
+    CreateChatCompletionRequest,
     CreateCompletionRequest,
     CreateEmbeddingRequest,
-    CreateChatCompletionRequest,
     ModelList,
 )
-from llama_cpp.server.errors import RouteErrorHandler
+from sse_starlette.sse import EventSourceResponse
+from starlette.concurrency import iterate_in_threadpool, run_in_threadpool
+from starlette_context.middleware import RawContextMiddleware
+from starlette_context.plugins import RequestIdPlugin  # type: ignore
+
+logging.basicConfig(
+    format="[%(asctime)s] [%(levelname)s] - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# log_queue = queue.Queue()
+# queue_handler = QueueHandler(log_queue)
+# logger.addHandler(queue_handler)
+
+# queue_listener = QueueListener(logging.StreamHandler())
+# queue_listener.start()
+
+
+class AlreadyLockedError(Exception):
+    pass
+
+
+class UnloadManager:
+    def __init__(
+        self,
+        timeout: float,
+        timeout_step: float = 0.1,
+        event_loop: asyncio.BaseEventLoop = None,
+    ) -> None:
+        self.__unload_timer = _UnloadTimer(timeout, timeout_step)
+        self.__event_loop = event_loop or asyncio.new_event_loop()
+
+        self.__lock = asyncio.Lock()
+        self.__task: asyncio.Task = None
+
+    async def __aenter__(self):
+        logger.debug("Aquiring Unload Lock")
+        if not self.__lock.locked():
+            await self.__lock.acquire()
+            logger.debug("Aquired Unload Lock")
+            return self
+        else:
+            raise AlreadyLockedError()
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        match (exc_type, exc_value, traceback):
+            case (None, None, None):
+                self.__task = None
+                self.__lock.release()
+            case _:
+                raise RuntimeError(
+                    "Error while exiting UnloadManager context"
+                ) from exc_type(exc_value).with_traceback(traceback)
+
+    def create_task(self, event_loop=None) -> asyncio.Task:
+        logger.debug("Creating Unload Task")
+        event_loop = event_loop or self.__event_loop
+        self.__task = event_loop.create_task(self.__unload_timer.schedule())
+        return self.__task
+
+    async def reset(self) -> None:
+        return await self.__unload_timer.reset()
+
+    async def suspend(self) -> bool:
+        """Cancel the unload task.
+
+        Returns:
+            bool: True if the task was canceled, False otherwise
+        """
+        if self.__task is None:
+            return False
+
+        logger.debug("Suspending Unload Task")
+        return await self.__unload_timer.suspend()
+
+    async def unsuspend(self) -> bool:
+        """Unancel the unload task.
+
+        Returns:
+            bool: True if the task was uncanceled, False otherwise
+        """
+        if self.__task is None:
+            return False
+
+        logger.debug("Unsuspending Unload Task")
+        return await self.__unload_timer.unsuspend()
+
+
+class _UnloadTimer:
+    def __init__(self, timeout: float, timeout_step: float = 0.1) -> None:
+        self.__timeout: float = timeout
+        self.__timeout_remainder: float = self.__timeout
+        self.__timeout_step: float = timeout_step
+        self.__suspend_counter = 0
+
+        self.__lock = asyncio.Lock()
+
+    async def schedule(self):
+        await self.reset()
+        while await self.timeout > 0:
+            await asyncio.sleep(self.timeout_step)
+            await self.decrement(self.timeout_step)
+        return _Unloader()
+
+    @property
+    async def timeout(self) -> float:
+        """Get the remaining timeout (async).
+
+        Returns:
+            float: The remaining timeout
+        """
+        async with self.__lock:
+            if bool(self.__suspend_counter):
+                return 1.0
+            return self.__timeout_remainder
+
+    @property
+    def timeout_step(self) -> float:
+        """Return the timeout polling step.
+
+        Returns:
+            float: The timeout polling step length
+        """
+        return self.__timeout_step
+
+    @property
+    async def suspended(self) -> bool:
+        async with self.__lock:
+            return bool(self.__suspend_counter)
+
+    async def suspend(self) -> bool:
+        async with self.__lock:
+            self.__suspend_counter += 1
+            return bool(self.__suspend_counter)
+
+    async def unsuspend(self) -> bool:
+        async with self.__lock:
+            self.__suspend_counter = max(0, self.__suspend_counter - 1)
+            return bool(self.__suspend_counter)
+
+    async def decrement(self, step: float) -> float:
+        """Decrement the timeout remainder by the given step.
+
+        Args:
+            step (float): The step to decrement by
+
+        Returns:
+            float: The remaining timeout after decrementing
+        """
+        async with self.__lock:
+            if not bool(self.__suspend_counter):
+                self.__timeout_remainder -= step
+            return self.__timeout_remainder
+
+    async def reset(self) -> float:
+        """Reset the timeout remainder to the original timeout.
+
+        Returns:
+            float: The remaining timeout after resetting
+        """
+        async with self.__lock:
+            self.__timeout_remainder = self.__timeout
+            return self.__timeout_remainder
+
+    async def reschedule(self, timeout: float) -> float:
+        """Reschedule the timeout remainder to the given timeout.
+
+        Args:
+            timeout (float): The new timeout
+
+        Returns:
+            float: The remaining timeout after rescheduling
+        """
+        self.__timeout = timeout
+        return await self.reset()
+
+
+class _Unloader:
+    @staticmethod
+    async def unload():
+        try:
+            logger.debug("_Unloader: get_llama_proxy()")
+            llama_proxy = next(get_llama_proxy())
+            # llama_proxy = await asyncio.wait_for(get_llama_proxy(), timeout=1)
+
+            if llama_proxy is not None:
+                logger.debug("_Unloader: Unloading Model")
+                # del llama_proxy._current_model
+                llama_proxy._current_model = None
+
+            return True
+        except asyncio.TimeoutError:
+            # Model still in use?
+            logger.warning(
+                "_Unloader: get_llama_proxy() timed out. Is the model still in use?"
+            )
+            return False
+
+
+UNLOAD_TIMEOUT: Final[float] = os.getenv("UNLOAD_TIMEOUT", 3600.)
+UNLOAD_POLLING: Final[float] = os.getenv("UNLOAD_POLLING", 10.)
+UNLOAD_MANAGER: Final[UnloadManager] = UnloadManager(UNLOAD_TIMEOUT, timeout_step=UNLOAD_POLLING)
+
+
+async def schedule_unload(event_loop, did_suspend: bool = False):
+    logger.debug("schedule_unload() called")
+
+    try:
+        if did_suspend is True:
+            logger.debug("Unsuspending Unload")
+            await UNLOAD_MANAGER.unsuspend()
+
+        async with UNLOAD_MANAGER as ctx:
+            logger.info("Scheduling Unload")
+
+            unload_task = ctx.create_task(event_loop)
+            logger.debug("Aquired Unload Task")
+
+            await unload_task
+            logger.debug("Awaited Unload Task")
+
+            if unload_task.cancelled():
+                logger.warning("Unload Task was canceled")
+                return None
+
+            unloader = unload_task.result()
+            if unloader is not None:
+                logger.info("Unloading Model")
+                await unloader.unload()
+            else:
+                logger.warning("Unload Task returned None")
+    except AlreadyLockedError as e:
+        logger.warning("Unload Lock already aquired, resetting timer.")
+        await UNLOAD_MANAGER.reset()
+    except Exception as e:
+        raise RuntimeError("Error while scheduling unload") from e
+
+
+async def suspend_unload():
+    logger.info("Suspending Unload")
+    return await UNLOAD_MANAGER.suspend()
 
 
 router = APIRouter(route_class=RouteErrorHandler)
@@ -199,8 +436,8 @@ async def authenticate(
 @router.post(
     "/v1/completions",
     summary="Completion",
-    dependencies=[Depends(authenticate)],    
-    response_model= Union[
+    dependencies=[Depends(authenticate)],
+    response_model=Union[
         llama_cpp.CreateCompletionResponse,
         str,
     ],
@@ -211,19 +448,19 @@ async def authenticate(
                 "application/json": {
                     "schema": {
                         "anyOf": [
-                            {"$ref": "#/components/schemas/CreateCompletionResponse"}                            
+                            {"$ref": "#/components/schemas/CreateCompletionResponse"}
                         ],
                         "title": "Completion response, when stream=False",
                     }
                 },
-                "text/event-stream":{
-                    "schema": {                     
-                      "type": "string",
-                      "title": "Server Side Streaming response, when stream=True. " +
-                        "See SSE format: https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events#Event_stream_format",  # noqa: E501
-                      "example": """data: {... see CreateCompletionResponse ...} \\n\\n data: ... \\n\\n ... data: [DONE]"""
+                "text/event-stream": {
+                    "schema": {
+                        "type": "string",
+                        "title": "Server Side Streaming response, when stream=True. "
+                        + "See SSE format: https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events#Event_stream_format",  # noqa: E501
+                        "example": """data: {... see CreateCompletionResponse ...} \\n\\n data: ... \\n\\n ... data: [DONE]""",
                     }
-                }
+                },
             },
         }
     },
@@ -236,8 +473,13 @@ async def authenticate(
 async def create_completion(
     request: Request,
     body: CreateCompletionRequest,
+    background_tasks: BackgroundTasks,
     llama_proxy: LlamaProxy = Depends(get_llama_proxy),
 ) -> llama_cpp.Completion:
+    suspended = await suspend_unload()
+    background_tasks.add_task(
+        schedule_unload, asyncio.get_event_loop(), did_suspend=suspended
+    )
     if isinstance(body.prompt, list):
         assert len(body.prompt) <= 1
         body.prompt = body.prompt[0] if len(body.prompt) > 0 else ""
@@ -301,8 +543,13 @@ async def create_completion(
 )
 async def create_embedding(
     request: CreateEmbeddingRequest,
+    background_tasks: BackgroundTasks,
     llama_proxy: LlamaProxy = Depends(get_llama_proxy),
 ):
+    suspended = await suspend_unload()
+    background_tasks.add_task(
+        schedule_unload, asyncio.get_event_loop(), did_suspend=suspended
+    )
     return await run_in_threadpool(
         llama_proxy(request.model).create_embedding,
         **request.model_dump(exclude={"user"}),
@@ -310,10 +557,10 @@ async def create_embedding(
 
 
 @router.post(
-    "/v1/chat/completions", summary="Chat", dependencies=[Depends(authenticate)],
-    response_model= Union[
-        llama_cpp.ChatCompletion, str
-    ],
+    "/v1/chat/completions",
+    summary="Chat",
+    dependencies=[Depends(authenticate)],
+    response_model=Union[llama_cpp.ChatCompletion, str],
     responses={
         "200": {
             "description": "Successful Response",
@@ -321,19 +568,21 @@ async def create_embedding(
                 "application/json": {
                     "schema": {
                         "anyOf": [
-                            {"$ref": "#/components/schemas/CreateChatCompletionResponse"}                            
+                            {
+                                "$ref": "#/components/schemas/CreateChatCompletionResponse"
+                            }
                         ],
                         "title": "Completion response, when stream=False",
                     }
                 },
-                "text/event-stream":{
-                    "schema": {                     
-                      "type": "string",
-                      "title": "Server Side Streaming response, when stream=True" +
-                        "See SSE format: https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events#Event_stream_format",  # noqa: E501
-                      "example": """data: {... see CreateChatCompletionResponse ...} \\n\\n data: ... \\n\\n ... data: [DONE]"""
+                "text/event-stream": {
+                    "schema": {
+                        "type": "string",
+                        "title": "Server Side Streaming response, when stream=True"
+                        + "See SSE format: https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events#Event_stream_format",  # noqa: E501
+                        "example": """data: {... see CreateChatCompletionResponse ...} \\n\\n data: ... \\n\\n ... data: [DONE]""",
                     }
-                }
+                },
             },
         }
     },
@@ -341,8 +590,13 @@ async def create_embedding(
 async def create_chat_completion(
     request: Request,
     body: CreateChatCompletionRequest,
+    background_tasks: BackgroundTasks,
     llama_proxy: LlamaProxy = Depends(get_llama_proxy),
 ) -> llama_cpp.ChatCompletion:
+    suspended = await suspend_unload()
+    background_tasks.add_task(
+        schedule_unload, asyncio.get_event_loop(), did_suspend=suspended
+    )
     exclude = {
         "n",
         "logit_bias_type",
